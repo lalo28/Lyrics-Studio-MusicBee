@@ -1,0 +1,6 @@
+PASS lexical delimiters: MB_TTMLLyrics.cs
+PASS lexical delimiters: ReleaseRegression.cs
+PASS release source contracts
+PASS protected parser, glyph/wrap, timing, factory designs and CPU baseline; intended karaoke clip correction only
+Source SHA256: bd2a2a3d184548cd20799870d0aade05b15dea08da42c8a949b843a23cf317bf
+STATIC ONLY: C# compilation, Windows tests and MusicBee visual acceptance are not covered.

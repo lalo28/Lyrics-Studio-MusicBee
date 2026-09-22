@@ -1,0 +1,17 @@
+# Preserve release-package bytes: SHA256SUMS.txt validates exact file content.
+# Keep Git from rewriting line endings in checksum-tracked text files.
+*.bat -text diff
+*.ps1 -text diff
+*.cs -text diff
+*.py -text diff
+*.md -text diff
+*.txt -text diff
+*.json -text diff
+*.diff -text diff
+*.elrc -text diff
+*.ttml -text diff
+
+*.png binary
+*.webp binary
+*.dll binary
+*.zip binary

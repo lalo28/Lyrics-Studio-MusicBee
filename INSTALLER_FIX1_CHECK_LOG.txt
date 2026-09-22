@@ -1,0 +1,13 @@
+2026-09-22 - Local preparation checks for Installer FIX1
+PASS plugin source matches the RC1 package byte for byte.
+PASS C# regression harness matches the RC1 package byte for byte.
+Source SHA256: a7d04105d7f2abbe63a9badd81e3ba51787b4448968d74570c2cbb217455ad75
+Harness SHA256: 5238f34c3170c4f7b114e0556b7baba42bb76bca567930394c8b11d708372b8c
+PASS all BAT and PowerShell files are ASCII with CRLF line endings.
+PASS lexical delimiter review of all three PowerShell scripts.
+PASS code review: File.Replace receives a unique same-folder backup path.
+PASS code review: backup cleanup requires successful destination hash verification.
+PASS code review: failures retain any available replacement backup.
+STATIC ONLY: Windows PowerShell syntax/runtime and new installer tests not executed here.
+USER-REPORTED RC1: Windows build + 134 C# checks passed; subsequent installation failed in Replace.
+PENDING: Installer FIX1 execution on Windows; MusicBee visual, playback and FPS acceptance.

@@ -1,0 +1,1652 @@
+--- RC1/src/MB_TTMLLyrics.cs
++++ RC2/src/MB_TTMLLyrics.cs
+@@ -30,7 +30,7 @@
+         public const short MinInterfaceVersion = 43;
+         public const short MinApiRevision = 57;
+ 
+-        // V23.55.0 RC1: profile-owned visual state, recoverable saves and bounded text wrap.
++        // V23.55.0 RC2: durable profiles/offsets, exact TTML ranges and safe projection/clips.
+         // Production release requires the Windows regression gate and MusicBee visual checks.
+         // V23.54.1 NO SPOTIFY FONT CONTRACT:
+         // - Spotify Mix UI / Spotify Mix / Circular requests are redirected to Roboto before
+@@ -305,7 +305,7 @@
+         private readonly object onlineSearchSync = new object();
+         private readonly HashSet<string> autoSearchAttempted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+         private bool onlineSearchInProgress = false;
+-        private const string PluginVersionText = "23.55.0-rc1";
++        private const string PluginVersionText = "23.55.0-rc2";
+         // V23.50.16 COMPOSITE BLUR SHEET CONTRACT:
+         // - V21 LIVE main/context glyphs remain LIVE PointF and are not cached/replaced.
+         // - Hybrid AMLL context blur precomposes the same 4/8 low-alpha tap geometry once per stable row/radius.
+@@ -950,6 +950,14 @@
+                 view = null;
+             }
+ 
++            // RC2: flush only an explicitly queued snapshot. A temporary safe start must
++            // never overwrite the user's configuration just because MusicBee is closing.
++            if (settings != null)
++            {
++                try { settings.FlushPendingSettingsV23550(); }
++                catch (Exception ex) { WriteDiagnostic("Final settings save failed: " + ex.Message); }
++            }
++
+             duplicateDockPanels.Clear();
+             lock (globalDockOwnerSync)
+             {
+@@ -2118,10 +2126,7 @@
+                     File.Copy(destination, backupPath, false);
+                     WriteDiagnostic("ONLINE Musixmatch package companion backup => " + backupPath);
+                 }
+-                string temp = destination + ".lyricsstudio.download.tmp";
+-                File.WriteAllText(temp, lyrics.Replace("\r\n", "\n").Replace("\n", Environment.NewLine), new UTF8Encoding(false));
+-                if (File.Exists(destination)) File.Copy(temp, destination, true); else File.Move(temp, destination);
+-                if (File.Exists(temp)) File.Delete(temp);
++                WriteTextAtomicallyV23550(destination, lyrics.Replace("\r\n", "\n").Replace("\n", Environment.NewLine), null);
+                 WriteDiagnostic("ONLINE Musixmatch package companion saved => " + destination);
+                 return destination;
+             }
+@@ -6358,9 +6363,6 @@
+                     }
+                 }
+ 
+-                temp = destination + ".lyricsstudio.download.tmp";
+-                File.WriteAllText(temp, lyrics.Replace("\r\n", "\n").Replace("\n", Environment.NewLine), new UTF8Encoding(false));
+-
+                 if (replaceExisting && hasExisting)
+                 {
+                     backupPath = NextOnlineBackupPath(existing);
+@@ -6378,9 +6380,7 @@
+                     WriteDiagnostic("ONLINE SAVE target backup created => " + targetBackup);
+                 }
+ 
+-                if (File.Exists(destination)) File.Copy(temp, destination, true);
+-                else File.Move(temp, destination);
+-                if (File.Exists(temp)) File.Delete(temp);
++                WriteTextAtomicallyV23550(destination, lyrics.Replace("\r\n", "\n").Replace("\n", Environment.NewLine), null);
+ 
+                 // Different extensions are separate sidecars and are intentionally preserved together.
+                 // A backup is created only when the exact destination path is actually overwritten.
+@@ -7851,27 +7851,16 @@
+ 
+             public static bool RestoreIniBackup(string sourcePath)
+             {
+-                string tempRestore = "";
+                 try
+                 {
+                     if (String.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath)) return false;
+-                    EnsureRecoveryFolder();
+-                    string restoreSource = sourcePath;
+-                    if (String.Equals(Path.GetFullPath(sourcePath), Path.GetFullPath(PreviousSettingsPath), StringComparison.OrdinalIgnoreCase))
+-                    {
+-                        tempRestore = Path.Combine(RecoveryFolderPath, ".__lyricsstudio_restore_previous.tmp");
+-                        File.Copy(sourcePath, tempRestore, true);
+-                        restoreSource = tempRestore;
+-                    }
+-                    if (File.Exists(SettingsPath))
+-                        File.Copy(SettingsPath, PreviousSettingsPath, true);
+-                    File.Copy(restoreSource, SettingsPath, true);
+-                    if (!String.IsNullOrWhiteSpace(tempRestore) && File.Exists(tempRestore)) File.Delete(tempRestore);
++                    // Read first: the selected source may be the backup that replacement rotates.
++                    string restored = File.ReadAllText(sourcePath, Encoding.UTF8);
++                    WriteTextAtomicallyV23550(SettingsPath, restored, PreviousSettingsPath);
+                     return true;
+                 }
+                 catch (Exception ex)
+                 {
+-                    try { if (!String.IsNullOrWhiteSpace(tempRestore) && File.Exists(tempRestore)) File.Delete(tempRestore); } catch { }
+                     WriteDiagnostic("Settings restore failed: " + ex.Message);
+                     return false;
+                 }
+@@ -10088,6 +10077,7 @@
+             private readonly object settingsSaveStateLockV23521C = new object();
+             private readonly object settingsSaveIoLockV23521C = new object();
+             private int settingsSaveGenerationV23521C = 0;
++            private Dictionary<string, string> settingsPendingSnapshotV23550;
+ 
+             private void WriteSettingsSnapshotV23521C(Dictionary<string, string> snapshot)
+             {
+@@ -10108,7 +10098,11 @@
+                 try { snapshot = ExportDictionary(); }
+                 catch (Exception ex) { WriteDiagnostic("Settings snapshot failed: " + ex.Message); return; }
+                 int generation;
+-                lock (settingsSaveStateLockV23521C) generation = ++settingsSaveGenerationV23521C;
++                lock (settingsSaveStateLockV23521C)
++                {
++                    generation = ++settingsSaveGenerationV23521C;
++                    settingsPendingSnapshotV23550 = snapshot;
++                }
+                 ThreadPool.QueueUserWorkItem(delegate
+                 {
+                     try
+@@ -10122,6 +10116,8 @@
+                             lock (settingsSaveStateLockV23521C)
+                                 if (generation != settingsSaveGenerationV23521C) return;
+                             WriteSettingsSnapshotV23521C(snapshot);
++                            lock (settingsSaveStateLockV23521C)
++                                if (generation == settingsSaveGenerationV23521C) settingsPendingSnapshotV23550 = null;
+                         }
+                     }
+                     catch (Exception ex) { WriteDiagnostic("Deferred settings save failed: " + ex.Message); }
+@@ -10130,17 +10126,39 @@
+ 
+             public void Save()
+             {
+-                Dictionary<string, string> snapshot;
+-                try { snapshot = ExportDictionary(); }
+-                catch (Exception ex) { WriteDiagnostic("Settings snapshot failed: " + ex.Message); return; }
+-                lock (settingsSaveStateLockV23521C) settingsSaveGenerationV23521C++;
+-                try
+-                {
+-                    lock (settingsSaveIoLockV23521C) WriteSettingsSnapshotV23521C(snapshot);
+-                }
++                try { SaveOrThrowV23550(); }
+                 catch (Exception ex)
+                 {
+                     WriteDiagnostic("Settings save failed: " + ex.Message);
++                }
++            }
++
++            public void SaveOrThrowV23550()
++            {
++                Dictionary<string, string> snapshot = ExportDictionary();
++                lock (settingsSaveStateLockV23521C)
++                {
++                    settingsSaveGenerationV23521C++;
++                    settingsPendingSnapshotV23550 = snapshot;
++                }
++                FlushPendingSettingsV23550();
++            }
++
++            public void FlushPendingSettingsV23550()
++            {
++                lock (settingsSaveIoLockV23521C)
++                {
++                    Dictionary<string, string> snapshot;
++                    int generation;
++                    lock (settingsSaveStateLockV23521C)
++                    {
++                        snapshot = settingsPendingSnapshotV23550;
++                        if (snapshot == null) return;
++                        generation = ++settingsSaveGenerationV23521C;
++                    }
++                    WriteSettingsSnapshotV23521C(snapshot);
++                    lock (settingsSaveStateLockV23521C)
++                        if (generation == settingsSaveGenerationV23521C) settingsPendingSnapshotV23550 = null;
+                 }
+             }
+         }
+@@ -10283,24 +10301,72 @@
+ 
+             public static string FindLocalPath(string name)
+             {
++                return FindLocalPathInFolderV23550(Folder, name);
++            }
++
++            private static string FindLocalPathInFolderV23550(string folder, string name)
++            {
+                 if (String.IsNullOrWhiteSpace(name)) return null;
+-                foreach (string path in ListLocalProfiles())
++                if (!Directory.Exists(folder)) return null;
++                foreach (string path in Directory.GetFiles(folder, "*.lyricsprofile.json"))
+                 {
+                     string fileName = Path.GetFileName(path).Replace(".lyricsprofile.json", "");
+                     if (fileName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                         return path;
++                    // Legacy sanitized names remain readable; never follow parent profiles here.
++                    if (fileName.Equals(SafeProfileFileName(name), StringComparison.OrdinalIgnoreCase))
++                    {
++                        try
++                        {
++                            if (new FileInfo(path).Length > 2097152) continue;
++                            string storedName;
++                            ParseProfileJsonV23550(File.ReadAllText(path, Encoding.UTF8), fileName, out storedName);
++                            if (storedName.Equals(name, StringComparison.OrdinalIgnoreCase)) return path;
++                        }
++                        catch (Exception ex) { WriteDiagnostic("Profile name lookup failed: " + ex.Message); }
++                    }
+                 }
+                 return null;
+             }
+ 
+-            public static string SaveLocal(string name, PluginSettings settings)
+-            {
+-                if (String.IsNullOrWhiteSpace(name)) name = "Mi perfil";
+-                string safe = Regex.Replace(name.Trim(), @"[\\/:*?""<>|]+", "_");
+-                if (!Directory.Exists(Folder)) Directory.CreateDirectory(Folder);
+-                string path = Path.Combine(Folder, safe + ".lyricsprofile.json");
++            public static string ValidateLocalNameV23550(string name)
++            {
++                string value = (name ?? "").Trim();
++                if (value.Length == 0 || value.Length > 120 || value.EndsWith(".", StringComparison.Ordinal) ||
++                    value.Any(delegate(char c) { return Char.IsControl(c) || "\\/:*?\"<>|".IndexOf(c) >= 0; }) ||
++                    Regex.IsMatch(value, @"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", RegexOptions.IgnoreCase))
++                    throw new ArgumentException("Elige un nombre de perfil válido, sin caracteres de ruta ni punto final (máximo 120 caracteres).");
++                if (LyricsView.IsBuiltInProfile(value) || value.Equals("Personalizado", StringComparison.OrdinalIgnoreCase))
++                    throw new ArgumentException("Ese nombre pertenece al programa. Usa otro nombre para tu perfil.");
++                return value;
++            }
++
++            public static string SaveLocal(string name, PluginSettings settings, bool overwrite = false)
++            {
++                return SaveLocalInFolderV23550(Folder, name, settings, overwrite);
++            }
++
++            private static string SaveLocalInFolderV23550(string folder, string name, PluginSettings settings, bool overwrite)
++            {
++                name = ValidateLocalNameV23550(name);
++                string path = Path.Combine(folder, name + ".lyricsprofile.json");
++                if (File.Exists(path) && !overwrite) throw new IOException("Ya existe un perfil con ese nombre: " + name);
+                 SaveFile(path, name, settings);
+                 return path;
++            }
++
++            public static string AvailableImportNameV23550(string name)
++            {
++                string stem = SafeProfileFileName(name).Trim().TrimEnd('.');
++                stem = new string(stem.Where(delegate(char c) { return !Char.IsControl(c); }).ToArray());
++                if (stem.Length > 100) stem = stem.Substring(0, 100).Trim().TrimEnd('.');
++                try { ValidateLocalNameV23550(stem); }
++                catch { stem = "Imported " + (stem.Length == 0 ? "Profile" : stem); }
++                string candidate = stem;
++                int suffix = 2;
++                while (File.Exists(Path.Combine(Folder, candidate + ".lyricsprofile.json")))
++                    candidate = stem + " (" + (suffix++).ToString(CultureInfo.InvariantCulture) + ")";
++                return ValidateLocalNameV23550(candidate);
+             }
+ 
+             public static void SaveFile(string path, string name, PluginSettings settings)
+@@ -10459,35 +10525,34 @@
+             {
+                 if (cache != null)
+                     return cache;
+-                cache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+-                try
+-                {
+-                    if (!File.Exists(OffsetPath))
+-                        return cache;
+-                    foreach (string raw in File.ReadAllLines(OffsetPath, Encoding.UTF8))
+-                    {
+-                        int eq = raw.IndexOf('=');
+-                        if (eq <= 0)
+-                            continue;
+-                        string encoded = raw.Substring(0, eq).Trim();
+-                        string value = raw.Substring(eq + 1).Trim();
+-                        int number;
+-                        if (!Int32.TryParse(value, out number))
+-                            continue;
+-                        try
+-                        {
+-                            string path = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+-                            if (!String.IsNullOrWhiteSpace(path))
+-                                cache[path] = Math.Max(-5000, Math.Min(5000, number));
+-                        }
+-                        catch { }
+-                    }
+-                }
+-                catch (Exception ex)
+-                {
+-                    WriteDiagnostic("Track offsets load failed: " + ex.Message);
+-                }
++                cache = ReadOffsetsV23550(OffsetPath);
+                 return cache;
++            }
++
++            private static Dictionary<string, int> ReadOffsetsV23550(string filePath)
++            {
++                Dictionary<string, int> loaded = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
++                if (!File.Exists(filePath)) return loaded;
++                foreach (string raw in File.ReadAllLines(filePath, Encoding.UTF8))
++                {
++                    // Base64 padding contains '='; the number follows the LAST separator.
++                    int eq = raw.LastIndexOf('=');
++                    if (eq <= 0)
++                        continue;
++                    string encoded = raw.Substring(0, eq).Trim();
++                    string value = raw.Substring(eq + 1).Trim();
++                    int number;
++                    if (!Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out number))
++                        continue;
++                    try
++                    {
++                        string path = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
++                        if (!String.IsNullOrWhiteSpace(path))
++                            loaded[path] = Math.Max(-5000, Math.Min(5000, number));
++                    }
++                    catch { }
++                }
++                return loaded;
+             }
+ 
+             public static int Get(string audioPath)
+@@ -10496,9 +10561,13 @@
+                     return 0;
+                 lock (Sync)
+                 {
+-                    Dictionary<string, int> all = LoadAll();
+-                    int value;
+-                    return all.TryGetValue(audioPath, out value) ? value : 0;
++                    try
++                    {
++                        Dictionary<string, int> all = LoadAll();
++                        int value;
++                        return all.TryGetValue(audioPath, out value) ? value : 0;
++                    }
++                    catch (Exception ex) { WriteDiagnostic("Track offsets load failed: " + ex.Message); return 0; }
+                 }
+             }
+ 
+@@ -10508,35 +10577,32 @@
+                     return;
+                 lock (Sync)
+                 {
+-                    Dictionary<string, int> all = LoadAll();
++                    Dictionary<string, int> all = new Dictionary<string, int>(LoadAll(), StringComparer.OrdinalIgnoreCase);
+                     int safe = Math.Max(-5000, Math.Min(5000, offsetMs));
+                     if (safe == 0)
+                         all.Remove(audioPath);
+                     else
+                         all[audioPath] = safe;
+                     SaveAll(all);
++                    cache = all;
+                 }
+             }
+ 
+             private static void SaveAll(Dictionary<string, int> all)
+             {
+-                try
+-                {
+-                    string folder = Path.GetDirectoryName(OffsetPath);
+-                    if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+-                    List<string> lines = new List<string>();
+-                    lines.Add("# MB_TTMLLyrics per-track offsets; path is UTF-8 Base64");
+-                    foreach (KeyValuePair<string, int> kv in all.OrderBy(delegate(KeyValuePair<string, int> x) { return x.Key; }))
+-                    {
+-                        string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(kv.Key));
+-                        lines.Add(encoded + "=" + kv.Value);
+-                    }
+-                    File.WriteAllLines(OffsetPath, lines.ToArray(), Encoding.UTF8);
+-                }
+-                catch (Exception ex)
+-                {
+-                    WriteDiagnostic("Track offsets save failed: " + ex.Message);
+-                }
++                WriteOffsetsV23550(OffsetPath, all);
++            }
++
++            private static void WriteOffsetsV23550(string path, Dictionary<string, int> all)
++            {
++                List<string> lines = new List<string>();
++                lines.Add("# MB_TTMLLyrics per-track offsets; path is UTF-8 Base64");
++                foreach (KeyValuePair<string, int> kv in all.OrderBy(delegate(KeyValuePair<string, int> x) { return x.Key; }))
++                {
++                    string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(kv.Key));
++                    lines.Add(encoded + "=" + kv.Value.ToString(CultureInfo.InvariantCulture));
++                }
++                WriteTextAtomicallyV23550(path, String.Join(Environment.NewLine, lines.ToArray()) + Environment.NewLine, path + ".bak");
+             }
+         }
+ 
+@@ -13394,20 +13460,25 @@
+                 string suggested = IsBuiltInProfile(settings.CurrentProfile) ? (settings.CurrentProfile + " Custom") : (settings.CurrentProfile ?? "My Theme");
+                 string name = PromptThemeText("Create Theme From Current Style", "Theme name:", suggested);
+                 if (String.IsNullOrWhiteSpace(name)) return;
++                Dictionary<string, string> previous = settings.ExportDictionary();
++                string previousEditing = editingProfileName;
+                 try
+                 {
++                    name = ProfileStore.ValidateLocalNameV23550(name);
+                     settings.ThemeFamily = name;
+                     settings.ThemeVariant = "Default";
+                     settings.CurrentProfile = name;
+                     settings.SmartDirector = false;
+                     ProfileStore.SaveLocal(name, settings);
+-                    settings.Save();
++                    settings.SaveOrThrowV23550();
++                    editingProfileName = name;
+                     BuildPanelMenu();
+                     BuildSettingsDrawer();
+                     MessageBox.Show("Theme created from the current style:\n" + name, "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                 }
+                 catch (Exception ex)
+                 {
++                    settings.ApplyDictionary(previous); editingProfileName = previousEditing; settings.SaveDeferredV23521C();
+                     MessageBox.Show("Could not create theme:\n" + ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                 }
+             }
+@@ -13424,20 +13495,25 @@
+                 string variant = PromptThemeText("Create Variant", "Variant name (for example Blue, Orange, Purple):", "Blue");
+                 if (String.IsNullOrWhiteSpace(variant)) return;
+                 string displayName = family + " — " + variant;
++                Dictionary<string, string> previous = settings.ExportDictionary();
++                string previousEditing = editingProfileName;
+                 try
+                 {
++                    displayName = ProfileStore.ValidateLocalNameV23550(displayName);
+                     settings.ThemeFamily = family;
+                     settings.ThemeVariant = variant;
+                     settings.CurrentProfile = displayName;
+                     settings.SmartDirector = false;
+                     ProfileStore.SaveLocal(displayName, settings);
+-                    settings.Save();
++                    settings.SaveOrThrowV23550();
++                    editingProfileName = displayName;
+                     BuildPanelMenu();
+                     BuildSettingsDrawer();
+                     MessageBox.Show("Variant created:\n" + family + "\n  └─ " + variant, "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                 }
+                 catch (Exception ex)
+                 {
++                    settings.ApplyDictionary(previous); editingProfileName = previousEditing; settings.SaveDeferredV23521C();
+                     MessageBox.Show("Could not create variant:\n" + ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                 }
+             }
+@@ -13468,7 +13544,6 @@
+ 
+                 Dictionary<string, string> originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase);
+                 bool designerDirty = false;
+-                bool designerCommitted = false;
+                 RectangleF previewLyricsRect = RectangleF.Empty;
+                 RectangleF previewInnerRect = RectangleF.Empty;
+                 RectangleF previewVisualRect = RectangleF.Empty;
+@@ -15947,11 +16022,12 @@
+                     if (designerDirty && MessageBox.Show("Discard the current unsaved designer changes and start a new profile?", "Profile Studio", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                     settings.ResetVisualDefaults(); settings.CurrentProfile = "Personalizado"; settings.SmartDirector = false; editingProfileName = ""; syncDesignerControls(); designerDirty = true; designerUndo.Clear(); designerRedo.Clear(); designerLastSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); ApplySettings(); saveDesignerRecovery(); profileTitle.Text = "New profile *"; preview.Invalidate(); bUndo.Enabled = false; bRedo.Enabled = false;
+                 };
+-                bSave.Click += delegate { SaveChangesToCurrentProfile(); designerCommitted = true; designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); };
+-                bSaveAs.Click += delegate { SaveProfileDialog(); designerCommitted = true; designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); };
+-                bRestore.Click += delegate { RestoreOrRevertCurrentProfile(); designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); syncDesignerControls(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); preview.Invalidate(); };
++                bSave.Click += delegate { if (!SaveChangesToCurrentProfile()) return; designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); };
++                bSaveAs.Click += delegate { if (!SaveProfileDialog()) return; designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); };
++                bRestore.Click += delegate { if (!RestoreOrRevertCurrentProfile()) return; designerDirty = false; originalSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); designerLastSnapshot = new Dictionary<string, string>(originalSnapshot, StringComparer.OrdinalIgnoreCase); designerUndo.Clear(); designerRedo.Clear(); bUndo.Enabled = false; bRedo.Enabled = false; clearDesignerRecovery(); syncDesignerControls(); profileTitle.Text = "Editing: " + (settings.CurrentProfile ?? "Personalizado"); preview.Invalidate(); };
+                 bExport.Click += delegate { ExportProfileDialog(); };
+-                bImport.Click += delegate { Dictionary<string, string> preImport = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); ImportProfileDialog(); designerUndo.Push(preImport); designerRedo.Clear(); designerDirty = true; designerLastSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); syncDesignerControls(); saveDesignerRecovery(); bUndo.Enabled = true; bRedo.Enabled = false; profileTitle.Text = (settings.CurrentProfile ?? "Personalizado") + "  *"; preview.Invalidate(); };
++                EventHandler importDesignerProfileV23550 = delegate { Dictionary<string, string> preImport = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); if (!ImportProfileDialog()) return; designerUndo.Push(preImport); designerRedo.Clear(); designerDirty = true; designerLastSnapshot = new Dictionary<string, string>(settings.ExportDictionary(), StringComparer.OrdinalIgnoreCase); syncDesignerControls(); saveDesignerRecovery(); bUndo.Enabled = true; bRedo.Enabled = false; profileTitle.Text = (settings.CurrentProfile ?? "Personalizado") + "  *"; preview.Invalidate(); };
++                bImport.Click += importDesignerProfileV23550;
+                 bAdvanced.Click += delegate { ToggleSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true; };
+                 bProSuite.Click += delegate { if (ShowProDirectorSuite()) { designerDirty = true; syncDesignerControls(); saveDesignerRecovery(); profileTitle.Text = (settings.CurrentProfile ?? "Personalizado") + "  *"; preview.Invalidate(); } };
+                 Action openUploadedFolder = delegate
+@@ -15975,7 +16051,7 @@
+                 form.AllowDrop = true; form.DragEnter += delegate(object sender, DragEventArgs e) { if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; }; form.DragDrop += delegate(object sender, DragEventArgs e) { try { string[] fps = e.Data.GetData(DataFormats.FileDrop) as string[]; if (fps != null) foreach (string fp in fps) installCustomFile(fp); } catch { } };
+                 bUploaded.Click += delegate { openUploadedFolder(); };
+                 bOpenUploaded.Click += delegate { openUploadedFolder(); };
+-                bImportProfileUploaded.Click += delegate { ImportProfileDialog(); preview.Invalidate(); };
++                bImportProfileUploaded.Click += importDesignerProfileV23550;
+                 bColors.Click += delegate { ShowThemeStudio("Colors"); };
+                 bMotion.Click += delegate { ToggleSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true; };
+                 bPlayback.Click += delegate { ToggleSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true; };
+@@ -15984,12 +16060,29 @@
+ 
+                 form.FormClosing += delegate(object sender, FormClosingEventArgs e)
+                 {
+-                    if (designerDirty && !designerCommitted)
++                    if (designerDirty)
+                     {
+                         DialogResult dr = MessageBox.Show("Save the current Profile Studio changes before closing?\n\nYes = save to current profile\nNo = discard\nCancel = keep editing", "Profile Studio", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                         if (dr == DialogResult.Cancel) { e.Cancel = true; return; }
+-                        if (dr == DialogResult.Yes) { SaveChangesToCurrentProfile(); designerCommitted = true; designerDirty = false; clearDesignerRecovery(); }
+-                        else { settings.ApplyDictionary(originalSnapshot); settings.Save(); ApplySettings(); designerDirty = false; clearDesignerRecovery(); }
++                        if (dr == DialogResult.Yes)
++                        {
++                            if (!SaveChangesToCurrentProfile()) { e.Cancel = true; return; }
++                            designerDirty = false; clearDesignerRecovery();
++                        }
++                        else
++                        {
++                            Dictionary<string, string> unsaved = settings.ExportDictionary();
++                            try
++                            {
++                                settings.ApplyDictionary(originalSnapshot); settings.SaveOrThrowV23550(); ApplySettings();
++                                designerDirty = false; clearDesignerRecovery();
++                            }
++                            catch (Exception ex)
++                            {
++                                settings.ApplyDictionary(unsaved); settings.SaveDeferredV23521C(); ApplySettings(); saveDesignerRecovery();
++                                e.Cancel = true; MessageBox.Show(ex.Message, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                            }
++                        }
+                     }
+                 };
+                 form.FormClosed += delegate { try { designerAnimationTimer.Stop(); designerAnimationTimer.Dispose(); } catch { } try { colorLabLiveTimer.Stop(); colorLabLiveTimer.Dispose(); } catch { } if (profileDesignerForm == form) profileDesignerForm = null; editingProfileName = ""; BuildPanelMenu(); if (settingsDrawer != null && settingsDrawer.Visible) BuildSettingsDrawer(); };
+@@ -16521,7 +16614,7 @@
+                     Button export = new Button { Text = "Export Theme JSON…", AutoSize = true }; export.Click += delegate { ExportProfileDialog(); }; tp.Controls.Add(export);
+                     Button import = new Button { Text = "Import Theme JSON…", AutoSize = true }; import.Click += delegate { ImportProfileDialog(); }; tp.Controls.Add(import);
+                     Label isolatedProfiles = new Label { Text = "Profiles are isolated: changing profile replaces the complete previous profile.", AutoSize = true, ForeColor = Color.Gainsboro, Margin = new Padding(4,12,4,4) }; tp.Controls.Add(isolatedProfiles);
+-                    Button resetFactory = new Button { Text = "Restore Factory Profile", AutoSize = true, Margin = new Padding(4,12,4,4) }; resetFactory.Click += delegate { if (IsBuiltInProfile(settings.CurrentProfile)) { RestoreCurrentFactoryProfile(); form.Close(); } }; tp.Controls.Add(resetFactory);
++                    Button resetFactory = new Button { Text = "Restore Factory Profile", AutoSize = true, Margin = new Padding(4,12,4,4) }; resetFactory.Click += delegate { if (IsBuiltInProfile(settings.CurrentProfile) && RestoreCurrentFactoryProfile()) form.Close(); }; tp.Controls.Add(resetFactory);
+ 
+                     if (!String.IsNullOrWhiteSpace(startTab))
+                     {
+@@ -18124,7 +18217,7 @@
+                 };
+             }
+ 
+-            private static bool IsBuiltInProfile(string name)
++            internal static bool IsBuiltInProfile(string name)
+             {
+                 if (String.IsNullOrWhiteSpace(name)) return false;
+                 return BuiltInProfiles().Concat(LegacyBuiltInProfiles())
+@@ -22486,108 +22579,127 @@
+                 }
+             }
+ 
+-            private void SaveChangesToCurrentProfile()
++            private bool SaveChangesToCurrentProfile()
+             {
+                 string name = !String.IsNullOrWhiteSpace(editingProfileName) ? editingProfileName : settings.CurrentProfile;
+-                if (String.IsNullOrWhiteSpace(name) || name.Equals("Personalizado", StringComparison.OrdinalIgnoreCase)) { SaveProfileDialog(); return; }
++                if (String.IsNullOrWhiteSpace(name) || name.Equals("Personalizado", StringComparison.OrdinalIgnoreCase)) return SaveProfileDialog();
+                 try
+                 {
+                     string path;
+-                    if (IsBuiltInProfile(name))
+-                    {
+-                        path = ProfileStore.SaveFactoryOverride(name, settings);
+-                        status = "Profile override saved: " + name;
+-                        MessageBox.Show("Changes saved on top of the factory profile.\n\nFactory original is still preserved.\nUse Restore factory at any time.\n\nExport JSON if you want to send me this exact version:\n" + path, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Information);
+-                    }
++                    if (IsBuiltInProfile(name)) path = ProfileStore.SaveFactoryOverride(name, settings);
+                     else
+                     {
+-                        string localPath = ProfileStore.FindLocalPath(name);
+-                        if (String.IsNullOrWhiteSpace(localPath)) { SaveProfileDialog(); return; }
+-                        ProfileStore.SaveFile(localPath, name, settings);
+-                        path = localPath;
+-                        status = "Profile saved: " + name;
+-                        MessageBox.Show("Changes saved to this profile.\n\nExport JSON if you want to send me this exact version:\n" + path, "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
+-                    }
+-                    settings.CurrentProfile = name; settings.SmartDirector = false;
+-                    editingProfileName = name; settings.Save();
++                        path = ProfileStore.FindLocalPath(name);
++                        if (String.IsNullOrWhiteSpace(path)) return SaveProfileDialog();
++                        ProfileStore.SaveFile(path, name, settings);
++                    }
++                    settings.CurrentProfile = name; settings.SmartDirector = false; editingProfileName = name;
++                    settings.SaveOrThrowV23550();
++                    status = "Profile saved: " + name;
+                     BuildPanelMenu(); BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
+-                }
+-                catch (Exception ex) { MessageBox.Show(ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+-            }
+-
+-            private void RestoreCurrentFactoryProfile()
++                    MessageBox.Show("Perfil guardado:\n" + path, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Information);
++                    return true;
++                }
++                catch (Exception ex)
++                {
++                    MessageBox.Show("No se pudo completar el guardado. Se conservan los cambios pendientes.\n" + ex.Message,
++                        "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                    return false;
++                }
++            }
++
++            private bool RestoreCurrentFactoryProfile()
+             {
+                 string name = !String.IsNullOrWhiteSpace(editingProfileName) ? editingProfileName : settings.CurrentProfile;
+-                if (!IsBuiltInProfile(name)) return;
+-                if (MessageBox.Show("Restore " + name + " to its original factory settings?", "Lyrics Studio 23.6.0", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
++                if (!IsBuiltInProfile(name)) return false;
++                if (MessageBox.Show("Restore " + name + " to its original factory settings?", "Lyrics Studio " + PluginVersionText,
++                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return false;
++                Dictionary<string, string> previous = settings.ExportDictionary();
++                string archived = null;
+                 try
+                 {
+-                    string archived = ProfileStore.DeleteFactoryOverride(name);
+-                    if (!ApplyPreset(name))
+-                    {
+-                        if (!String.IsNullOrWhiteSpace(archived)) File.Move(archived, ProfileStore.FactoryOverridePath(name));
+-                        return;
+-                    }
++                    archived = ProfileStore.DeleteFactoryOverride(name);
++                    if (!ApplyPreset(name)) throw new InvalidOperationException("Factory profile could not be applied.");
++                    settings.SaveOrThrowV23550();
+                     editingProfileName = name;
+                     QueueProfileUiRefreshV23521B(true, settingsDrawer != null && settingsDrawer.Visible);
+-                }
+-                catch (Exception ex) { MessageBox.Show("Factory reset could not be completed.\n" + ex.Message, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+-            }
+-
+-            private void RestoreOrRevertCurrentProfile()
++                    return true;
++                }
++                catch (Exception ex)
++                {
++                    settings.ApplyDictionary(previous); settings.Save();
++                    try { ApplySettingsProfileTransactionV23521B(); } catch { }
++                    try
++                    {
++                        if (!String.IsNullOrWhiteSpace(archived) && File.Exists(archived))
++                            File.Move(archived, ProfileStore.FactoryOverridePath(name));
++                    }
++                    catch (Exception restoreError) { WriteDiagnostic("Factory override retained at " + archived + ": " + restoreError.Message); }
++                    MessageBox.Show("Factory reset could not be completed.\n" + ex.Message, "Lyrics Studio " + PluginVersionText,
++                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                    return false;
++                }
++            }
++
++            private bool RestoreOrRevertCurrentProfile()
+             {
+                 string name = !String.IsNullOrWhiteSpace(editingProfileName) ? editingProfileName : settings.CurrentProfile;
+-                if (IsBuiltInProfile(name))
+-                {
+-                    RestoreCurrentFactoryProfile();
+-                    return;
+-                }
++                if (IsBuiltInProfile(name)) return RestoreCurrentFactoryProfile();
+                 string local = ProfileStore.FindLocalPath(name);
+-                if (String.IsNullOrWhiteSpace(local) || !File.Exists(local)) return;
+-                if (MessageBox.Show("Discard unsaved changes and reload the last saved version of " + name + "?", "Lyrics Studio 23.6.0", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+-                if (!LoadProfileFromPath(local, false)) return;
++                if (String.IsNullOrWhiteSpace(local) || !File.Exists(local)) return false;
++                if (MessageBox.Show("Discard unsaved changes and reload the last saved version of " + name + "?", "Lyrics Studio " + PluginVersionText,
++                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return false;
++                if (!LoadProfileFromPath(local, false)) return false;
++                try { settings.FlushPendingSettingsV23550(); }
++                catch (Exception ex) { MessageBox.Show(ex.Message, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning); return false; }
+                 editingProfileName = name;
+                 status = "Profile reverted: " + name;
+                 QueueProfileUiRefreshV23521B(true, settingsDrawer != null && settingsDrawer.Visible);
+-            }
+-
+-            private void SaveProfileDialog()
+-            {
+-                string name = PromptProfileName(settings.CurrentProfile == "Personalizado" ? "Mi perfil" : settings.CurrentProfile);
+-                if (String.IsNullOrWhiteSpace(name)) return;
++                return true;
++            }
++
++            private bool SaveProfileDialog()
++            {
++                string suggested = settings.CurrentProfile == "Personalizado" ? "Mi perfil" : settings.CurrentProfile;
++                if (IsBuiltInProfile(suggested)) suggested += " Custom";
++                string name = PromptProfileName(suggested);
++                if (String.IsNullOrWhiteSpace(name)) return false;
++                return SaveNamedLocalProfileV23550(name);
++            }
++
++            private bool SaveNamedLocalProfileV23550(string name)
++            {
++                string previousName = settings.CurrentProfile, previousEditing = editingProfileName;
++                bool previousSmart = settings.SmartDirector;
+                 try
+                 {
+-                    string path = ProfileStore.SaveLocal(name, settings);
+-                    settings.CurrentProfile = name;
+-                    settings.SmartDirector = false;
+-                    settings.Save();
+-                    MessageBox.Show("Perfil guardado:\n" + path, "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
+-                    BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
++                    name = ProfileStore.ValidateLocalNameV23550(name);
++                    string existing = ProfileStore.FindLocalPath(name);
++                    if (!String.IsNullOrEmpty(existing) && MessageBox.Show("Ya existe '" + name + "'. ¿Reemplazarlo conservando una copia anterior?",
++                        "Lyrics Studio " + PluginVersionText, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return false;
++                    string path = ProfileStore.SaveLocal(name, settings, !String.IsNullOrEmpty(existing));
++                    settings.CurrentProfile = name; settings.SmartDirector = false; editingProfileName = name;
++                    settings.SaveOrThrowV23550();
++                    BuildPanelMenu(); BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
++                    MessageBox.Show("Perfil guardado:\n" + path, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Information);
++                    return true;
+                 }
+                 catch (Exception ex)
+                 {
+-                    MessageBox.Show("No se pudo guardar el perfil:\n" + ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                    settings.CurrentProfile = previousName; settings.SmartDirector = previousSmart; editingProfileName = previousEditing;
++                    settings.SaveDeferredV23521C();
++                    MessageBox.Show("No se pudo completar el guardado. Se conservan los cambios pendientes.\n" + ex.Message,
++                        "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                    return false;
+                 }
+             }
+ 
+             private void DuplicateProfileDialog()
+             {
+-                string baseName = String.IsNullOrWhiteSpace(settings.CurrentProfile) || settings.CurrentProfile == "Personalizado"
++                string suggested = String.IsNullOrWhiteSpace(settings.CurrentProfile) || settings.CurrentProfile == "Personalizado"
+                     ? "Mi perfil copia" : settings.CurrentProfile + " copia";
+-                string name = PromptProfileName(baseName);
+-                if (String.IsNullOrWhiteSpace(name)) return;
+-                try
+-                {
+-                    string existing = ProfileStore.FindLocalPath(name);
+-                    if (!String.IsNullOrEmpty(existing) &&
+-                        MessageBox.Show("Ya existe un perfil con ese nombre. ¿Reemplazarlo?", "Lyrics Studio 23.6.0",
+-                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+-                        return;
+-                    ProfileStore.SaveLocal(name, settings);
+-                    settings.CurrentProfile = name; settings.SmartDirector = false; settings.Save();
+-                    BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
+-                }
+-                catch (Exception ex) { MessageBox.Show(ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
++                string name = PromptProfileName(suggested);
++                if (!String.IsNullOrWhiteSpace(name)) SaveNamedLocalProfileV23550(name);
+             }
+ 
+             private void RenameProfileDialog()
+@@ -22595,37 +22707,33 @@
+                 string oldName = settings.CurrentProfile ?? "";
+                 if (String.IsNullOrWhiteSpace(oldName) || IsBuiltInProfile(oldName) || oldName.Equals("Personalizado", StringComparison.OrdinalIgnoreCase))
+                 {
+-                    MessageBox.Show("Los perfiles de fábrica no se renombran. Usa Duplicar o Guardar como perfil para crear uno editable.",
+-                        "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
++                    MessageBox.Show("Usa Guardar como para crear un perfil con otro nombre.", "Lyrics Studio " + PluginVersionText,
++                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                     return;
+                 }
+-
+                 string oldPath = ProfileStore.FindLocalPath(oldName);
+-                if (String.IsNullOrEmpty(oldPath))
+-                {
+-                    MessageBox.Show("No encontré el archivo local de este perfil. Puedes guardarlo con un nombre nuevo.",
+-                        "Lyrics Studio 23.6.0", MessageBoxButtons.OK, MessageBoxIcon.Information);
+-                    return;
+-                }
+-
+-                string newName = PromptProfileName(oldName);
+-                if (String.IsNullOrWhiteSpace(newName) || newName.Equals(oldName, StringComparison.OrdinalIgnoreCase)) return;
++                if (String.IsNullOrEmpty(oldPath)) return;
++                string name = PromptProfileName(oldName);
++                if (String.IsNullOrWhiteSpace(name) || name.Equals(oldName, StringComparison.OrdinalIgnoreCase)) return;
++                string previousEditing = editingProfileName;
++                bool previousSmart = settings.SmartDirector;
+                 try
+                 {
+-                    string existing = ProfileStore.FindLocalPath(newName);
+-                    if (!String.IsNullOrEmpty(existing))
+-                    {
+-                        MessageBox.Show("Ya existe un perfil llamado '" + newName + "'. Elige otro nombre.",
+-                            "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+-                        return;
+-                    }
+-                    string newPath = ProfileStore.SaveLocal(newName, settings);
+-                    if (!String.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase) && File.Exists(oldPath))
+-                        File.Delete(oldPath);
+-                    settings.CurrentProfile = newName; settings.SmartDirector = false; settings.Save();
+-                    BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
+-                }
+-                catch (Exception ex) { MessageBox.Show(ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
++                    name = ProfileStore.ValidateLocalNameV23550(name);
++                    if (!String.IsNullOrEmpty(ProfileStore.FindLocalPath(name))) throw new IOException("Ya existe un perfil llamado '" + name + "'.");
++                    ProfileStore.SaveLocal(name, settings);
++                    settings.CurrentProfile = name; settings.SmartDirector = false; editingProfileName = name;
++                    settings.SaveOrThrowV23550();
++                    File.Move(oldPath, oldPath + "." + Guid.NewGuid().ToString("N") + ".renamed.bak");
++                    BuildPanelMenu(); BuildSettingsDrawer(); if (settingsDrawer != null) settingsDrawer.Visible = true;
++                }
++                catch (Exception ex)
++                {
++                    settings.CurrentProfile = oldName; settings.SmartDirector = previousSmart; editingProfileName = previousEditing;
++                    settings.Save();
++                    MessageBox.Show("No se pudo completar el cambio de nombre. Los archivos guardados se conservan.\n" + ex.Message,
++                        "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                }
+             }
+ 
+             private void ExportProfileDialog()
+@@ -22645,14 +22753,14 @@
+                 }
+             }
+ 
+-            private void ImportProfileDialog()
++            private bool ImportProfileDialog()
+             {
+                 using (OpenFileDialog dlg = new OpenFileDialog())
+                 {
+                     dlg.Filter = "Lyrics Studio profile (*.lyricsprofile.json;*.json)|*.lyricsprofile.json;*.json";
+                     dlg.Multiselect = false;
+-                    if (dlg.ShowDialog(FindForm()) != DialogResult.OK) return;
+-                    LoadProfileFromPath(dlg.FileName, true);
++                    if (dlg.ShowDialog(FindForm()) != DialogResult.OK) return false;
++                    return LoadProfileFromPath(dlg.FileName, true);
+                 }
+             }
+ 
+@@ -22671,6 +22779,7 @@
+                     importedPreviewV23110.ApplyProfileDictionaryV23110(importedProfileV23110);
+                     if (askPreview)
+                     {
++                        profileName = ProfileStore.AvailableImportNameV23550(profileName);
+                         string summary = "Perfil: " + profileName +
+                             "\nTema: " + importedPreviewV23110.Theme +
+                             "\nLayout: " + importedPreviewV23110.Layout +
+@@ -22679,6 +22788,8 @@
+                             "\n\n¿Importar estos ajustes?";
+                         if (MessageBox.Show(summary, "Vista previa del perfil", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                             return false;
++                        // Register the complete local snapshot before selecting it.
++                        ProfileStore.SaveLocal(profileName, importedPreviewV23110);
+                     }
+                     bool keepFixedChanges = false;
+                     bool preserveZoomLock = false;
+@@ -22748,7 +22859,7 @@
+                     RestoreProfilePaletteGuardV23521D(paletteGuardV23521D);
+                     ApplySettingsProfileTransactionV23521B();
+                     editingProfileName = profileName;
+-                    settings.SaveDeferredV23521C();
++                    if (askPreview) settings.SaveOrThrowV23550(); else settings.SaveDeferredV23521C();
+                     QueueProfileUiRefreshV23521B(true, settingsDrawer != null && settingsDrawer.Visible);
+                     return true;
+                 }
+@@ -26004,13 +26115,21 @@
+ 
+             private void SetTrackOffset(int valueMs)
+             {
+-                trackOffsetMs = Math.Max(-5000, Math.Min(5000, valueMs));
+-                if (!String.IsNullOrWhiteSpace(audioPath))
+-                    TrackOffsetStore.Set(audioPath, trackOffsetMs);
+-                settings.UsePerTrackOffset = true;
+-                settings.Save();
+-                WriteDiagnostic("Track offset => " + trackOffsetMs + "ms | " + audioPath);
+-                Invalidate();
++                try
++                {
++                    int next = Math.Max(-5000, Math.Min(5000, valueMs));
++                    if (!String.IsNullOrWhiteSpace(audioPath)) TrackOffsetStore.Set(audioPath, next);
++                    trackOffsetMs = next;
++                    settings.UsePerTrackOffset = true;
++                    settings.SaveOrThrowV23550();
++                    WriteDiagnostic("Track offset => " + trackOffsetMs + "ms | " + audioPath);
++                    Invalidate();
++                }
++                catch (Exception ex)
++                {
++                    WriteDiagnostic("Track offset save failed: " + ex.Message);
++                    MessageBox.Show("No se pudo guardar la sincronización:\n" + ex.Message, "Lyrics Studio " + PluginVersionText, MessageBoxButtons.OK, MessageBoxIcon.Warning);
++                }
+             }
+ 
+             private void ToggleFullscreen()
+@@ -26175,7 +26294,6 @@
+                     projected.RemoveInstrumentalMarkRequested += delegate { EventHandler h = RemoveInstrumentalMarkRequested; if (h != null) h(this, EventArgs.Empty); };
+                     projected.ReloadRequested += delegate { EventHandler h = ReloadRequested; if (h != null) h(this, EventArgs.Empty); };
+                     projected.LyricsPathChanged += delegate(string changedPath) { lyricsPath = changedPath ?? lyricsPath; Action<string> h = LyricsPathChanged; if (h != null) h(changedPath); };
+-                    projected.LoadTrack(audioPath, lyricsPath, currentEmbeddedLyrics);
+                     projected.runtimePlaybackVisualStyle = runtimePlaybackVisualStyle;
+                     projected.onlineStatusText = "PROJECTION · resize/move · F11 fullscreen · Ctrl+Shift+wheel transparency · Esc close";
+                     projected.onlineStatusUntil = Environment.TickCount + 6000;
+@@ -26201,6 +26319,9 @@
+                         if (settingsDrawer != null && settingsDrawer.Visible) BuildSettingsDrawer();
+                     };
+                     form.Show(this.FindForm());
++                    // Show creates the control handle before an asynchronous parser can publish.
++                    projected.LoadTrack(audioPath, lyricsPath, currentEmbeddedLyrics);
++                    projected.runtimePlaybackVisualStyle = runtimePlaybackVisualStyle;
+                     form.Activate();
+                     projected.Focus();
+                     ConfigureFrameSchedulerV2365();
+@@ -27276,7 +27397,7 @@
+                 autoFitViewportKey = Int32.MinValue;
+                 lastFontScale = -1;
+                 renderTextAreaValid = false;
+-                settings.Save();
++                settings.SaveDeferredV23521C();
+                 status = (untimed ? "Untimed Zoom " : "Zoom ") + nextZoom + "%";
+                 ApplyTypographySettingsV2342();
+             }
+@@ -27591,7 +27712,10 @@
+                             PublishParsedTrackV23521C(parsedV23521C, parseErrorV23521C);
+                         });
+                     }
+-                    catch { }
++                    catch (Exception ex)
++                    {
++                        if (!IsDisposed && !Disposing) WriteDiagnostic("Lyrics publication failed: " + ex.Message);
++                    }
+                 });
+             }
+ 
+@@ -31052,7 +31176,7 @@
+                 // V20.0.4 SAFE_AREA_ZOOM_FINAL: clip to the actual assigned Lyrics Area, not
+                 // the whole control. Wrapping/fitting should make clipping unnecessary, but
+                 // this is the final guard against animation/glow offsets leaking into MusicBee.
+-                g.SetClip(new RectangleF(textLeft - 2f, contentTop, Math.Max(1f, usableWidth + 4f), Math.Max(1f, contentBottom - contentTop)));
++                g.SetClip(new RectangleF(textLeft - 2f, contentTop, Math.Max(1f, usableWidth + 4f), Math.Max(1f, contentBottom - contentTop)), CombineMode.Intersect);
+ 
+                 renderCoreVisibleLinesV2390 = 0;
+                 renderCoreCulledLinesV2390 = 0;
+@@ -41146,7 +41270,7 @@
+                             : Math.Max(0f,Math.Min(wrappedRowWidthsScratchV23100[r],filled-consumed));
+                         if (rowFill>0.25f)
+                         {
+-                            GraphicsState st=g.Save(); g.SetClip(new RectangleF(x-1,y-3,rowFill+2,size.Height+6));
++                            GraphicsState st=g.Save(); g.SetClip(new RectangleF(x-1,y-3,rowFill+2,size.Height+6), CombineMode.Intersect);
+                             using(SolidBrush br=new SolidBrush(activeColor)) DrawTypographic(g,row.Text,drawFont,br,x,y); g.Restore(st);
+                         }
+                         if (!ShouldUseUnifiedLogicalLineBlockV2337(rows.Count)) DrawActiveLineAnimations(g, new RectangleF(x, y, Math.Max(1f, size.Width), Math.Max(1f, size.Height)), activeAnimation, lineProgress);
+@@ -41164,7 +41288,7 @@
+                         RectangleF gb=MeasureCharacterBounds(g,row.Text,drawFont,localStart,Math.Min(localLength,row.Text.Length-localStart));
+                         float left=x+gb.X, pw=Math.Max(1f,gb.Width);
+                         Color karaokeColor = GetKaraokeColor(seg.BeginMs,seg.EndMs,positionMs);
+-                        GraphicsState st=g.Save(); g.SetClip(new RectangleF(left-1.5f,y-3,(float)(pw*prog)+3f,size.Height+6));
++                        GraphicsState st=g.Save(); g.SetClip(new RectangleF(left-1.5f,y-3,(float)(pw*prog)+3f,size.Height+6), CombineMode.Intersect);
+                         using(SolidBrush br=new SolidBrush(karaokeColor)) DrawTypographic(g,row.Text,drawFont,br,x,y); g.Restore(st);
+                         DrawKaraokeProgressFeather(g, row.Text, drawFont, x, y, left, pw, prog, karaokeColor, size.Height, localStart, localLength);
+                         DrawKaraokeGlow(g,new RectangleF(left,y,pw,size.Height),seg.BeginMs,seg.EndMs,positionMs);
+@@ -41226,7 +41350,7 @@
+                     if (prog > 0.0)
+                     {
+                         GraphicsState st = g.Save();
+-                        g.SetClip(new RectangleF(xMain - 2f, top - 2f, Math.Max(1f, (float)(mainSize.Width * Math.Min(1.0, prog)) + 4f), mainSize.Height + 4f));
++                        g.SetClip(new RectangleF(xMain - 2f, top - 2f, Math.Max(1f, (float)(mainSize.Width * Math.Min(1.0, prog)) + 4f), mainSize.Height + 4f), CombineMode.Intersect);
+                         using (SolidBrush active = new SolidBrush(GetKaraokeColor(line.BeginMs, line.EndMs, positionMs))) DrawTypographic(g, primary, mainFont, active, xMain, top);
+                         g.Restore(st);
+                     }
+@@ -41575,7 +41699,7 @@
+                     RectangleF clipRect = new RectangleF(segmentLeft - 1.5f, y - 3, clipWidth + 3f, size.Height + 6);
+                     Color karaokeColor = GetKaraokeColor(seg.BeginMs, seg.EndMs, positionMs);
+                     GraphicsState state = g.Save();
+-                    g.SetClip(clipRect);
++                    g.SetClip(clipRect, CombineMode.Intersect);
+                     using (SolidBrush bright = new SolidBrush(karaokeColor))
+                     {
+                         float karaokeY = y;
+@@ -43019,7 +43143,7 @@
+                         if (paint.Individual)
+                         {
+                             GraphicsState state = g.Save();
+-                            g.SetClip(paint.ClipRect);
++                            g.SetClip(paint.ClipRect, CombineMode.Intersect);
+                             bool usedCachedLiftV2370 = false;
+                             if (UseGpuTextCacheV2370())
+                             {
+@@ -43316,7 +43440,7 @@
+                         RectangleF clipRect = new RectangleF(segmentLeft - 1.5f, y - 3, clipWidth + 3f, size.Height + 6);
+                         Color karaokeColor = GetKaraokeColor(seg.BeginMs, seg.EndMs, positionMs);
+                         GraphicsState state = g.Save();
+-                        g.SetClip(clipRect);
++                        g.SetClip(clipRect, CombineMode.Intersect);
+                         using (SolidBrush bright = new SolidBrush(karaokeColor))
+                         {
+                             float karaokeY = y;
+@@ -43480,7 +43604,7 @@
+                         {
+                             RectangleF clipRect = new RectangleF(x - 1, y - 3, rowFill + 2, size.Height + 6);
+                             GraphicsState state = g.Save();
+-                            g.SetClip(clipRect);
++                            g.SetClip(clipRect, CombineMode.Intersect);
+                             using (SolidBrush bright = new SolidBrush(activeColor))
+                                 DrawTypographic(g, row.Text, font, bright, x, y);
+                             g.Restore(state);
+@@ -43525,7 +43649,7 @@
+                             (float)(pieceWidth * progress) + 3f, size.Height + 6);
+                         Color karaokeColorV23517 = GetKaraokeColor(seg.BeginMs, seg.EndMs, positionMs);
+                         GraphicsState state = g.Save();
+-                        g.SetClip(clipRect);
++                        g.SetClip(clipRect, CombineMode.Intersect);
+                         using (SolidBrush bright = new SolidBrush(karaokeColorV23517))
+                             DrawTypographic(g, row.Text, font, bright, x, y);
+                         g.Restore(state);
+@@ -43719,7 +43843,7 @@
+                             : Math.Max(0f,Math.Min(wrappedRowWidthsScratchV23100[r],filled-consumed));
+                         if (rowFill>0.25f)
+                         {
+-                            GraphicsState st=g.Save(); g.SetClip(new RectangleF(x-1,y-3,rowFill+2,size.Height+6));
++                            GraphicsState st=g.Save(); g.SetClip(new RectangleF(x-1,y-3,rowFill+2,size.Height+6), CombineMode.Intersect);
+                             Bitmap lineFillV2380 = UseGpuTextCacheV2370() ? GetV21TextLayerBitmapV2370(g, "uniform-line-fill", row.Text, drawFont, activeColor, activeColor.A, 0.0, false, false) : null;
+                             if (lineFillV2380 != null) DrawV21TextLayerBitmapV2370(g, lineFillV2380, x, y);
+                             else using(SolidBrush br=new SolidBrush(activeColor)) DrawTypographic(g,row.Text,drawFont,br,x,y);
+@@ -43864,7 +43988,7 @@
+                         GraphicsState st = g.Save();
+                         try
+                         {
+-                            g.SetClip(paint.ClipRect);
++                            g.SetClip(paint.ClipRect, CombineMode.Intersect);
+                             using (SolidBrush br = new SolidBrush(paint.Color))
+                                 DrawTypographic(g, row.Text, drawFont, br, x, y);
+                             actualCalls++;
+@@ -44697,7 +44821,7 @@
+                         {
+                             RectangleF clipRect = new RectangleF(x - 1, y - 3, rowFill + 2, size.Height + 6);
+                             GraphicsState state = g.Save();
+-                            g.SetClip(clipRect);
++                            g.SetClip(clipRect, CombineMode.Intersect);
+                             using (SolidBrush bright = new SolidBrush(activeColor))
+                                 DrawTypographic(g, row.Text, font, bright, x, y);
+                             g.Restore(state);
+@@ -44742,7 +44866,7 @@
+                             (float)(pieceWidth * progress) + 3f, size.Height + 6);
+                         Color karaokeColor = GetKaraokeColor(seg.BeginMs, seg.EndMs, positionMs);
+                         GraphicsState state = g.Save();
+-                        g.SetClip(clipRect);
++                        g.SetClip(clipRect, CombineMode.Intersect);
+                         using (SolidBrush bright = new SolidBrush(karaokeColor))
+                             DrawTypographic(g, row.Text, font, bright, x, y);
+                         g.Restore(state);
+@@ -45898,7 +46022,7 @@
+                 SizeF size = MeasureTypographic(g, line.Text, font);
+                 RectangleF clipRect = new RectangleF(x - 1, y - 3, (float)(width * progress) + 2, size.Height + 6);
+                 GraphicsState state = g.Save();
+-                g.SetClip(clipRect);
++                g.SetClip(clipRect, CombineMode.Intersect);
+                 bool usedCachedProgressV2370 = false;
+                 if (UseGpuTextCacheV2370())
+                 {
+@@ -46470,7 +46594,7 @@
+                         GraphicsState rimState = g.Save();
+                         try
+                         {
+-                            g.SetClip(new RectangleF(bounds.Left - 1f, bounds.Top - 1f, bounds.Width + 2f, Math.Max(2f, bounds.Height * .34f)));
++                            g.SetClip(new RectangleF(bounds.Left - 1f, bounds.Top - 1f, bounds.Width + 2f, Math.Max(2f, bounds.Height * .34f)), CombineMode.Intersect);
+                             DrawCachedBlurGlyphV2367(g, rim, x, y - Math.Max(.25f, font.Size * .0045f));
+                         }
+                         finally { g.Restore(rimState); }
+@@ -46547,7 +46671,7 @@
+                 GraphicsState featherState = g.Save();
+                 try
+                 {
+-                    g.SetClip(featherClip);
++                    g.SetClip(featherClip, CombineMode.Intersect);
+                     int startAlpha = amllWordFade ? 205 : 165;
+                     if (continuousFlow) startAlpha = Math.Min(228, startAlpha + (int)(14f * flowBudget));
+                     using (LinearGradientBrush featherBrush = new LinearGradientBrush(
+@@ -46564,7 +46688,7 @@
+                     {
+                         float core = Math.Max(1.2f, feather * .24f);
+                         RectangleF coreClip = new RectangleF(boundary - core, textY - 3f, core * 1.55f, Math.Max(4f, lineHeight) + 6f);
+-                        g.SetClip(coreClip, CombineMode.Replace);
++                        g.SetClip(coreClip, CombineMode.Intersect);
+                         using (LinearGradientBrush coreBrush = new LinearGradientBrush(
+                             new PointF(boundary - core, textY), new PointF(boundary + core * .55f, textY),
+                             WithAlpha(Blend(karaokeColor, Color.White, .16f), Math.Max(16, (int)(92 * flowBudget))), Color.FromArgb(0, karaokeColor)))
+@@ -49938,20 +50062,10 @@
+             private void SaveColorVariantV225()
+             {
+                 string strategy = EffectiveAdaptiveColorStrategyV225();
+-                string recipe = EffectiveBackgroundRecipeV223();
+-                string baseName = String.IsNullOrWhiteSpace(settings.CurrentProfile) || settings.CurrentProfile.Equals("Personalizado", StringComparison.OrdinalIgnoreCase)
++                string suggested = String.IsNullOrWhiteSpace(settings.CurrentProfile) || settings.CurrentProfile.Equals("Personalizado", StringComparison.OrdinalIgnoreCase)
+                     ? "Color Variant" : settings.CurrentProfile + " · " + strategy;
+-                string name = PromptProfileName(baseName);
+-                if (String.IsNullOrWhiteSpace(name)) return;
+-                try
+-                {
+-                    string path = ProfileStore.SaveLocal(name, settings);
+-                    settings.CurrentProfile = name; settings.SmartDirector = false; settings.Save();
+-                    editingProfileName = name;
+-                    MessageBox.Show("Color variant saved.\n\nStyle: " + strategy + "\nBackground: " + recipe + "\n\n" + path,
+-                        "Lyrics Studio 23.4.0 · Save Color Variant", MessageBoxButtons.OK, MessageBoxIcon.Information);
+-                }
+-                catch (Exception ex) { MessageBox.Show(ex.Message, "Lyrics Studio 23.30.0", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
++                string name = PromptProfileName(suggested);
++                if (!String.IsNullOrWhiteSpace(name)) SaveNamedLocalProfileV23550(name);
+             }
+ 
+             private void ResetColorLabOnlyV225()
+@@ -52328,10 +52442,14 @@
+                     }
+ 
+                     int trimStart = builder.Text.Length - builder.Text.TrimStart().Length;
+-                    if (trimStart > 0)
+-                    {
+-                        foreach (LyricSegment segment in builder.Segments)
+-                            segment.StartChar = Math.Max(0, segment.StartChar - trimStart);
++                    foreach (LyricSegment segment in builder.Segments)
++                    {
++                        // Intersect BOTH original endpoints with the surviving text interval.
++                        // Moving the start alone makes a trimmed span claim the next word.
++                        int start = Math.Max(trimStart, segment.StartChar);
++                        int segmentEnd = Math.Min(trimStart + text.Length, segment.StartChar + segment.Length);
++                        segment.StartChar = Math.Max(0, start - trimStart);
++                        segment.Length = Math.Max(0, segmentEnd - start);
+                     }
+ 
+                     List<LyricSegment> segments = builder.Segments
+--- RC1/tests/ReleaseRegression.cs
++++ RC2/tests/ReleaseRegression.cs
+@@ -59,11 +59,15 @@
+             storeType = plugin.GetNestedType("ProfileStore", All);
+             string folder = Path.GetFullPath(args[1]);
+             Directory.CreateDirectory(folder);
+-            Check((string)plugin.GetField("PluginVersionText", All).GetRawConstantValue() == "23.55.0-rc1", "release version");
++            Check((string)plugin.GetField("PluginVersionText", All).GetRawConstantValue() == "23.55.0-rc2", "release version");
+             TestProfiles(folder);
++            TestLocalProfiles(folder);
++            TestTrackOffsets(folder);
+             TestTextElements();
+             TestWrap();
+             TestParsers();
++            TestTtmlRanges();
++            TestKaraokeClip();
+             TestAtomicWrite(folder);
+             Console.WriteLine("RESULT: " + checks + " checks passed. MusicBee visual acceptance NOT tested.");
+             return 0;
+@@ -136,6 +140,124 @@
+             (string)Get(s, "ActiveLineSurfaceV2337") == "None", "fresh lightweight startup");
+     }
+ 
++    private static void TestLocalProfiles(string folder)
++    {
++        string profiles = Path.Combine(folder, "local-profiles");
++        object s = Settings();
++        Set(s, "FontName", "Roboto"); Set(s, "FontScale", 123); Set(s, "ProfileParentName", "old parent");
++        string path = (string)Call(storeType, null, "SaveLocalInFolderV23550", profiles, "Canción azul", s, false);
++        Check((string)Call(storeType, null, "FindLocalPathInFolderV23550", profiles, "Canción azul") == path, "registered local profile can be found after saving");
++        object[] load = { path, null };
++        object restored = Call(storeType, null, "LoadFile", load);
++        Check((string)load[1] == "Canción azul" && (int)Get(restored, "FontScale") == 123 &&
++            (string)Get(restored, "FontName") == "Roboto" && (string)Get(restored, "ProfileParentName") == "", "detached local profile reloads its saved settings");
++        string original = File.ReadAllText(path);
++        Reject(delegate { Call(storeType, null, "SaveLocalInFolderV23550", profiles, "CANCIÓN AZUL", s, false); }, "case collision requires explicit replacement");
++        Check(File.ReadAllText(path) == original, "rejected duplicate preserves profile");
++        foreach (string name in new string[] { "Mix:A", "Mix?A", "../outside", "CON", "aux.txt", "bad.", "Apple Flow", "Personalizado", "bad\nname" })
++        {
++            string invalid = name;
++            Reject(delegate { Call(storeType, null, "SaveLocalInFolderV23550", profiles, invalid, s, false); }, "unsafe or reserved local name rejected: " + name.Replace('\n', ' '));
++        }
++        string legacy = Path.Combine(profiles, "Mix_A.lyricsprofile.json");
++        Call(storeType, null, "SaveFile", legacy, "Mix:A", s);
++        Check((string)Call(storeType, null, "FindLocalPathInFolderV23550", profiles, "Mix:A") == legacy, "legacy sanitized name remains readable");
++        Check(Call(storeType, null, "FindLocalPathInFolderV23550", profiles, "Mix?A") == null, "legacy filename does not alias a different display name");
++        Set(s, "FontScale", 145);
++        Call(storeType, null, "SaveLocalInFolderV23550", profiles, "Canción azul", s, true);
++        Check(File.ReadAllText(path + ".bak") == original, "explicit replacement preserves previous profile");
++    }
++
++    private static void TestTrackOffsets(string folder)
++    {
++        Type offsets = plugin.GetNestedType("TrackOffsetStore", All);
++        string path = Path.Combine(folder, "offsets.ini");
++        Dictionary<string, int> expected = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) {
++            { @"C:\a.mp3", 140 }, { @"C:\ab.mp3", -250 }, { @"C:\abc.mp3", 5000 },
++            { @"C:\Música\Canción 歌.mp3", -5000 } };
++        Call(offsets, null, "WriteOffsetsV23550", path, expected);
++        Dictionary<string, int> actual = (Dictionary<string, int>)Call(offsets, null, "ReadOffsetsV23550", path);
++        Check(actual.Count == expected.Count && expected.All(delegate(KeyValuePair<string, int> kv) { return actual[kv.Key] == kv.Value; }),
++            "offsets survive disk reload: all Base64 padding cases, Unicode and signed values");
++        string original = File.ReadAllText(path);
++        expected.Remove(@"C:\a.mp3");
++        Call(offsets, null, "WriteOffsetsV23550", path, expected);
++        Check(File.ReadAllText(path + ".bak") == original, "offset update retains previous store");
++        actual = (Dictionary<string, int>)Call(offsets, null, "ReadOffsetsV23550", path);
++        Check(!actual.ContainsKey(@"C:\a.mp3") && actual.Count == 3, "removed offset stays removed after reload");
++        string saved = File.ReadAllText(path);
++        using (FileStream locked = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
++        {
++            Reject(delegate { Call(offsets, null, "WriteOffsetsV23550", path, new Dictionary<string, int>()); }, "locked offset save reports failure");
++            Reject(delegate { Call(offsets, null, "ReadOffsetsV23550", path); }, "unreadable offset store is not treated as empty");
++        }
++        Check(File.ReadAllText(path) == saved, "failed offset write preserves all songs");
++    }
++
++    private static void TestTtmlRanges()
++    {
++        Type parser = plugin.GetNestedType("LyricsParser", All);
++        foreach (string first in new string[] { "  Hola ", "\n  Hola ", "<span>  Hola </span>" })
++        {
++            string xml = "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p begin=\"00:00:01.000\" end=\"00:00:05.000\">" +
++                "<span begin=\"00:00:01.000\" end=\"00:00:02.000\">" + first + "</span>" +
++                "<span begin=\"00:00:02.000\" end=\"00:00:04.000\">mundo  </span></p></div></body></tt>";
++            object parsed = Call(parser, null, "ParseText", xml, "TTML", 12000);
++            object line = ((IList)Get(parsed, "Lines"))[0];
++            IList segments = (IList)Get(line, "Segments");
++            string text = (string)Get(line, "Text");
++            Check(text == "Hola mundo" && segments.Count == 2, "TTML trims text without adding segments");
++            Check((int)Get(segments[0], "StartChar") == 0 && (int)Get(segments[0], "Length") == 5 &&
++                (int)Get(segments[1], "StartChar") == 5 && (int)Get(segments[1], "Length") == 5, "TTML trimmed spans have exact nonoverlapping ranges");
++            Check((double)Get(segments[0], "BeginMs") == 1000 && (double)Get(segments[0], "EndMs") == 2000 &&
++                (double)Get(segments[1], "BeginMs") == 2000 && (double)Get(segments[1], "EndMs") == 4000, "TTML trimming preserves word times");
++        }
++    }
++
++    private static void TestKaraokeClip()
++    {
++        object view = FormatterServices.GetUninitializedObject(viewType);
++        object s = Settings();
++        Set(s, "KaraokeStyle", "Classic"); Set(s, "WordFocusEffectV2329", "Off");
++        Set(s, "HighlightFeatherPro", false); Set(s, "MotionEngine2V2323", false);
++        Set(s, "SyllablePulse", false); Set(s, "MelismaHold", false);
++        Set(s, "CustomProfileColors", false); Set(s, "ActiveLineAnimation", "Original / Viewer Default");
++        Set(view, "settings", s); Set(view, "activeColor", Color.White); Set(view, "hoverColor", Color.White);
++        FieldInfo scratch = viewType.GetField("karaokePaintScratchV2390", All);
++        scratch.SetValue(view, Activator.CreateInstance(scratch.FieldType));
++        Type lineType = plugin.GetNestedType("LyricLine", All), segmentType = plugin.GetNestedType("LyricSegment", All);
++        object line = Activator.CreateInstance(lineType, true);
++        string text = "MMMMMMMM MMMM MMMMMMMM";
++        Set(line, "Text", text);
++        int[] starts = { 0, 9, 14 }, lengths = { 9, 5, 8 };
++        for (int i = 0; i < starts.Length; i++)
++        {
++            object segment = Activator.CreateInstance(segmentType, true);
++            Set(segment, "StartChar", starts[i]); Set(segment, "Length", lengths[i]);
++            Set(segment, "BeginMs", i * 1000.0); Set(segment, "EndMs", i == 2 ? 4000.0 : (i + 1) * 1000.0);
++            ((IList)Get(line, "Segments")).Add(segment);
++        }
++        object row = Activator.CreateInstance(viewType.GetNestedType("VisualRow", All), true);
++        Set(row, "Text", text); Set(row, "Length", text.Length); Set(row, "StartChar", 0);
++        foreach (double now in new double[] { 500.0, 3000.0 })
++        using (Bitmap bitmap = new Bitmap(400, 90))
++        using (Graphics g = Graphics.FromImage(bitmap))
++        using (Font font = new Font("Segoe UI", 28f, FontStyle.Bold))
++        {
++            Rectangle safe = new Rectangle(90, 0, 80, 80);
++            g.Clear(Color.Black); g.SetClip(safe);
++            SizeF size = (SizeF)Call(viewType, null, "MeasureTypographic", g, text, font);
++            Call(viewType, view, "DrawWrappedKaraokeSegmentsBatchedV23511", g, line, row, font, 0f, 5f, size, now);
++            Check(g.ClipBounds == (RectangleF)safe, "karaoke restores the caller clip");
++            int inside = 0, outside = 0;
++            for (int y = 0; y < bitmap.Height; y++)
++            for (int x = 0; x < bitmap.Width; x++)
++                if (bitmap.GetPixel(x, y).ToArgb() != Color.Black.ToArgb())
++                { if (safe.Contains(x, y)) inside++; else outside++; }
++            Check(inside > 0 && outside == 0, "actual wrapped karaoke respects lyrics area: t=" + now);
++        }
++    }
++
+     private static void TestTextElements()
+     {
+         string[] clusters = { "a\u0301", "\U0001F600", "\U0001F44D\U0001F3FD",
+--- RC1/tests/InstallerRegression.ps1
++++ RC2/tests/InstallerRegression.ps1
+@@ -6,6 +6,7 @@
+     throw 'Installer regression must run on Windows.'
+ }
+ . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\FileOperations.ps1')
++. (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\ReleaseState.ps1')
+ 
+ function Assert-Installer([bool]$condition, [string]$message) {
+     if (-not $condition) { throw "Installer regression failed: $message" }
+@@ -16,6 +17,88 @@
+         $_.Name -match '\.[0-9a-f]{32}\.(new|previous)$'
+     })
+     Assert-Installer ($remaining.Count -eq 0) 'no transfer temporaries left'
++}
++
++function Test-ReleaseState([string]$folder) {
++    $data = Join-Path $folder 'state\MusicBee data'
++    $plugins = Join-Path $folder 'state\Plugins'
++    $backup = Join-Path $folder 'state\Backup'
++    [IO.Directory]::CreateDirectory($plugins) | Out-Null
++    [IO.Directory]::CreateDirectory((Join-Path $data 'LyricsStudio\Profiles')) | Out-Null
++    $dll = Join-Path $plugins 'MB_TTMLLyrics.dll'
++    $ini = Join-Path $data 'MB_TTMLLyrics.ini'
++    $offsets = Join-Path $data 'MB_TTMLLyrics.offsets.ini'
++    $profile = Join-Path $data 'LyricsStudio\Profiles\test.lyricsprofile.json'
++    $files = @($dll,$ini,$offsets,$profile)
++    foreach ($file in $files) { [IO.File]::WriteAllText($file, 'old:' + $file) }
++    Copy-Verified $dll (Join-Path $backup 'MB_TTMLLyrics.dll')
++    Backup-Configuration $backup $data
++    @{ Schema=2; PluginDirectory=$plugins; HadDll=$true; PreviousHash=(Hash $dll) } |
++        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'receipt.json') -Encoding UTF8
++    Write-BackupManifest $backup
++    Assert-Installer (Test-Path -LiteralPath (Join-Path $backup 'MB_TTMLLyrics.offsets.ini')) 'configuration backup includes song offsets'
++    foreach ($file in $files) { [IO.File]::WriteAllText($file, 'current:' + $file) }
++    $newProfile = Join-Path $data 'LyricsStudio\Profiles\created-after-install.lyricsprofile.json'
++    [IO.File]::WriteAllText($newProfile, 'personal profile')
++
++    # Share.Read allows all preflight backups/hashes, but denies Replace/Delete.
++    # These failures therefore happen after earlier replacements really occurred.
++    foreach ($lockedPath in @($ini,$offsets,$profile)) {
++        $handle = [IO.File]::Open($lockedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
++        $failure = ''
++        try {
++            try { Restore-ReleaseFiles $backup $data (Join-Path $folder ('rollback-' + [Guid]::NewGuid().ToString('N'))) }
++            catch { $failure = $_.Exception.Message }
++        } finally { $handle.Dispose() }
++        Assert-Installer ($failure.Contains('Transaction rolled back')) 'restore failure rolls back earlier files'
++        foreach ($file in $files) {
++            Assert-Installer ([IO.File]::ReadAllText($file) -eq ('current:' + $file)) 'failed restore preserves entire previous installation'
++        }
++    }
++
++    $backedProfile = Join-Path $backup 'Profiles\test.lyricsprofile.json'
++    $original = [IO.File]::ReadAllText($backedProfile)
++    [IO.File]::WriteAllText($backedProfile, 'corrupted backup')
++    $rejected = $false
++    try { Restore-ReleaseFiles $backup $data (Join-Path $folder 'corrupt-restore') } catch { $rejected = $true }
++    Assert-Installer $rejected 'corrupt configuration backup rejects restore before changing the DLL'
++    Assert-Installer ([IO.File]::ReadAllText($dll) -eq ('current:' + $dll)) 'corrupt backup preserves current DLL'
++    [IO.File]::WriteAllText($backedProfile, $original)
++
++    Restore-ReleaseFiles $backup $data (Join-Path $folder 'successful-restore')
++    foreach ($file in $files) { Assert-Installer ([IO.File]::ReadAllText($file) -eq ('old:' + $file)) 'complete restore returns DLL, settings, offsets and profiles' }
++    Assert-Installer ([IO.File]::ReadAllText($newProfile) -eq 'personal profile') 'restore preserves profiles created after installation'
++
++    $manifest = Join-Path $backup 'backup-files.json'
++    [IO.File]::Move($manifest, $manifest + '.hold')
++    $rejected = $false
++    try { Read-VerifiedBackup $backup | Out-Null } catch { $rejected = $true }
++    Assert-Installer $rejected 'RC2 backup without its manifest is rejected'
++    [IO.File]::Move($manifest + '.hold', $manifest)
++
++    # First installation: failure writing its receipt must remove the newly created DLL.
++    $newDll = Join-Path $plugins 'first-install.dll'
++    $receipt = Join-Path $folder 'locked-receipt.txt'
++    [IO.File]::WriteAllText($receipt, 'previous receipt')
++    $handle = [IO.File]::Open($receipt, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
++    $failure = ''
++    try {
++        $operations = @(
++            @{ Source=$dll; Destination=$newDll; Remove=$false },
++            @{ Source=$ini; Destination=$receipt; Remove=$false }
++        )
++        try { Invoke-VerifiedFileTransaction $operations (Join-Path $folder 'install-rollback') }
++        catch { $failure = $_.Exception.Message }
++    } finally { $handle.Dispose() }
++    Assert-Installer ($failure.Contains('Transaction rolled back') -and -not (Test-Path -LiteralPath $newDll)) 'failed first install leaves no new DLL'
++    Assert-Installer ([IO.File]::ReadAllText($receipt) -eq 'previous receipt') 'failed installation preserves old restore receipt'
++
++    $legacy = Join-Path $folder 'legacy-backup'
++    Copy-Verified $dll (Join-Path $legacy 'MB_TTMLLyrics.dll')
++    @{ PluginDirectory=$plugins; HadDll=$true; PreviousHash=(Hash $dll) } |
++        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $legacy 'receipt.json') -Encoding UTF8
++    $legacyReceipt = Read-VerifiedBackup $legacy
++    Assert-Installer ($legacyReceipt.HadDll) 'existing RC1 backups remain readable'
+ }
+ 
+ $sandbox = Join-Path ([IO.Path]::GetTempPath()) ('LyricsStudio-installer-test-' + [Guid]::NewGuid().ToString('N'))
+@@ -72,6 +155,8 @@
+     Assert-Installer $missingFailure 'missing source rejects replacement'
+     Assert-Installer ((Hash $target) -eq (Hash $oldSource)) 'missing source leaves installed DLL intact'
+     Assert-NoTransferFiles $folder
++    Test-ReleaseState $folder
++    Assert-NoTransferFiles $folder
+     $succeeded = $true
+     Write-Host 'INSTALLER REGRESSION PASS. MusicBee files were not touched.'
+ } finally {
+--- RC1/tests/validate_source.py
++++ RC2/tests/validate_source.py
+@@ -1,11 +1,13 @@
+ """Portable source/package checks. This is NOT a C# compiler or a rendering test."""
+ from pathlib import Path
++from functools import lru_cache
+ import hashlib
+ import re
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ 
++@lru_cache(maxsize=3)
+ def mask_csharp(text):
+     result = list(text)
+     i = 0
+@@ -95,16 +97,26 @@
+     assert "TextHint" in method(source, "MakeTypographicMetricKeyV2390")
+     assert "new Font(settings.FontName" not in source
+     assert "V23.54.1 NO SPOTIFY FONT CONTRACT" in source
+-    assert 'PluginVersionText = "23.55.0-rc1"' in source
++    assert 'PluginVersionText = "23.55.0-rc2"' in source
+     for token in ["acrylic-safe-cache", "RENDER_PANEL60_SINGLE_SURFACE", "UseV21ExactLyricPipelineV2364", "OnProgressiveStartupTickV23120"]:
+         assert token in source, "Missing previous contract: " + token
+     print("PASS release source contracts")
+     if len(sys.argv) > 1:
+         previous = Path(sys.argv[1]).read_text(encoding="utf-8-sig")
+-        assert source[source.index("        private static class LyricsParser"): ] == previous[previous.index("        private static class LyricsParser"): ], "Lyrics parser changed"
++        # RC2 intentionally corrects TTML character ranges and nested drawing clips.
++        # All other parser behavior, word progress and glyph/wrap measurements stay frozen.
++        parser_start = "        private static class LyricsParser"
++        ttml_start = "        private static class TtmlParser"
++        assert source[source.index(parser_start):source.index(ttml_start)] == previous[previous.index(parser_start):previous.index(ttml_start)], "Non-TTML parser changed"
++        for name in ["BuildBalancedRows", "GetUniformBlockHeight", "SafeTextEndsV23550", "MeasureTypographic",
++                     "GetWrappedSegmentPieceProgressV23517", "SegmentProgress", "GetKaraokeColor",
++                     "ApplyCpuV21TextOnlyStartupV2364", "ApplyFactory10NaturalDesignV23540", "SetGradientFromString"]:
++            assert method(source, name) == method(previous, name), "Protected behavior changed: " + name
+         for name in ["DrawV21KaraokeSegmentsOptimizedV2367", "DrawWrappedKaraokeSegmentsBatchedV23511"]:
+-            assert method(source, name) == method(previous, name), "Karaoke drawing changed: " + name
+-        print("PASS parser and core karaoke unchanged from supplied baseline")
++            before = method(previous, name)
++            expected = before.replace("g.SetClip(paint.ClipRect);", "g.SetClip(paint.ClipRect, CombineMode.Intersect);")
++            assert method(source, name) == expected, "Unexpected karaoke change beyond clip preservation: " + name
++        print("PASS protected parser, glyph/wrap, timing, factory designs and CPU baseline; intended karaoke clip correction only")
+     print("Source SHA256:", hashlib.sha256((ROOT / "src/MB_TTMLLyrics.cs").read_bytes()).hexdigest())
+     print("STATIC ONLY: C# compilation, Windows tests and MusicBee visual acceptance are not covered.")
+ 
+--- RC1/scripts/Release.ps1
++++ RC2/scripts/Release.ps1
+@@ -18,6 +18,7 @@
+     }
+ }
+ . (Join-Path $PSScriptRoot 'FileOperations.ps1')
++. (Join-Path $PSScriptRoot 'ReleaseState.ps1')
+ function Assert-Package {
+     $manifest = [IO.File]::ReadAllLines((Join-Path $root 'SHA256SUMS.txt'))
+     if ($manifest.Length -lt 10) { throw 'Package manifest is empty or incomplete.' }
+@@ -75,18 +76,6 @@
+     Write-Host 'MusicBee playback, visual output and FPS still require manual acceptance.'
+     return $destination
+ }
+-function Backup-Configuration([string]$destination) {
+-    $ini = Join-Path $musicBeeData 'MB_TTMLLyrics.ini'
+-    if (Test-Path -LiteralPath $ini) { Copy-Verified $ini (Join-Path $destination 'MB_TTMLLyrics.ini') }
+-    foreach ($name in @('Profiles','ProfileOverrides')) {
+-        $folder = Join-Path $musicBeeData ('LyricsStudio\' + $name)
+-        if (Test-Path -LiteralPath $folder) {
+-            foreach ($file in Get-ChildItem -LiteralPath $folder -File -Filter '*.lyricsprofile.json') {
+-                Copy-Verified $file.FullName (Join-Path $destination ($name + '\' + $file.Name))
+-            }
+-        }
+-    }
+-}
+ function Install-Release([string]$dll) {
+     Assert-Closed
+     $targetFolder = $PluginDirectory
+@@ -100,66 +89,30 @@
+     [IO.Directory]::CreateDirectory($backup) | Out-Null
+     $hadDll = Test-Path -LiteralPath $target
+     if ($hadDll) { Copy-Verified $target (Join-Path $backup 'MB_TTMLLyrics.dll') }
+-    Backup-Configuration $backup
++    Backup-Configuration $backup $musicBeeData
+     $previousHash = if ($hadDll) { Hash (Join-Path $backup 'MB_TTMLLyrics.dll') } else { '' }
+-    @{ PluginDirectory=$targetFolder; HadDll=$hadDll; PreviousHash=$previousHash; Version='23.55.0-rc1'; InstalledHash=(Hash $dll) } |
++    @{ PluginDirectory=$targetFolder; HadDll=$hadDll; PreviousHash=$previousHash; Schema=2; Version='23.55.0-rc2'; InstalledHash=(Hash $dll) } |
+         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backup 'receipt.json') -Encoding UTF8
+     Assert-Closed
+-    $phase = 'DLL replacement'
+-    try {
+-        Replace-Verified $dll $target
+-        $phase = 'restore receipt replacement'
+-        $receiptSource = Join-Path $backup 'restore-path.txt'
+-        [IO.File]::WriteAllText($receiptSource, $backup)
+-        Replace-Verified $receiptSource $receiptPath
+-    } catch {
+-        $installFailure = $_
+-        Write-Host "Installation failed during $phase. Backup: $backup" -ForegroundColor Red
+-        try {
+-            if ($hadDll) {
+-                if (-not (Test-Path -LiteralPath $target) -or (Hash $target) -ne $previousHash) {
+-                    Replace-Verified (Join-Path $backup 'MB_TTMLLyrics.dll') $target
+-                    Write-Host 'Previous DLL restored after the failed installation.'
+-                } else { Write-Host 'Previous DLL is unchanged.' }
+-            } elseif (Test-Path -LiteralPath $target) {
+-                Move-Item -LiteralPath $target -Destination (Join-Path $backup 'failed-new.dll')
+-                Write-Host 'Failed new installation moved to the backup folder.'
+-            }
+-        } catch {
+-            Write-Host "DLL recovery also failed: $($_.Exception.Message). Backup retained: $backup" -ForegroundColor Red
+-        }
+-        throw $installFailure
+-    }
++    $receiptSource = Join-Path $backup 'restore-path.txt'
++    [IO.File]::WriteAllText($receiptSource, $backup)
++    Write-BackupManifest $backup
++    $operations = @(
++        @{ Source=$dll; Destination=$target; Remove=$false },
++        @{ Source=$receiptSource; Destination=$receiptPath; Remove=$false }
++    )
++    $recovery = Join-Path $backupRoot ('Install-recovery-' + [Guid]::NewGuid().ToString('N'))
++    Invoke-VerifiedFileTransaction $operations $recovery
+     Write-Host "RC installed. Backup: $backup"
+     Write-Host 'Open MusicBee and run the short checks in RELEASE_CHECKLIST.md before treating this as stable.'
+ }
+ function Restore-Release {
+     Assert-Closed
+-    $backup = [IO.File]::ReadAllText($receiptPath).Trim()
+-    if (-not $backup.StartsWith($backupRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid backup receipt.' }
+-    $receipt = Get-Content -LiteralPath (Join-Path $backup 'receipt.json') -Raw | ConvertFrom-Json
+-    if ($receipt.HadDll -and (Hash (Join-Path $backup 'MB_TTMLLyrics.dll')) -ne $receipt.PreviousHash) {
+-        throw 'Backup DLL checksum mismatch; restore cancelled.'
+-    }
+-    $target = Join-Path $receipt.PluginDirectory 'MB_TTMLLyrics.dll'
++    $backup = [IO.Path]::GetFullPath([IO.File]::ReadAllText($receiptPath).Trim())
++    $canonicalRoot = [IO.Path]::GetFullPath($backupRoot).TrimEnd('\')
++    if (-not $backup.StartsWith($canonicalRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid backup receipt.' }
+     $recovery = Join-Path $backupRoot ('Before-restore-' + [Guid]::NewGuid().ToString('N'))
+-    [IO.Directory]::CreateDirectory($recovery) | Out-Null
+-    if (Test-Path -LiteralPath $target) { Copy-Verified $target (Join-Path $recovery 'MB_TTMLLyrics.dll') }
+-    Backup-Configuration $recovery
+-    if ($receipt.HadDll) { Replace-Verified (Join-Path $backup 'MB_TTMLLyrics.dll') $target }
+-    elseif (Test-Path -LiteralPath $target) { Move-Item -LiteralPath $target -Destination (Join-Path $recovery 'removed-RC.dll') }
+-    $ini = Join-Path $backup 'MB_TTMLLyrics.ini'
+-    if (Test-Path -LiteralPath $ini) { Replace-Verified $ini (Join-Path $musicBeeData 'MB_TTMLLyrics.ini') }
+-    foreach ($name in @('Profiles','ProfileOverrides')) {
+-        $folder = Join-Path $backup $name
+-        if (Test-Path -LiteralPath $folder) {
+-            foreach ($file in Get-ChildItem -LiteralPath $folder -File -Filter '*.lyricsprofile.json') {
+-                $destination = Join-Path $musicBeeData ('LyricsStudio\' + $name + '\' + $file.Name)
+-                [IO.Directory]::CreateDirectory((Split-Path -Parent $destination)) | Out-Null
+-                Replace-Verified $file.FullName $destination
+-            }
+-        }
+-    }
++    Restore-ReleaseFiles $backup $musicBeeData $recovery
+     Write-Host "Previous DLL and backed-up settings restored. Pre-restore copy: $recovery"
+     Write-Host 'New profile files created after installation are preserved; no personal profile was deleted.'
+ }
+@@ -170,7 +123,7 @@
+     Start-Transcript -LiteralPath $logPath | Out-Null
+     $transcript = $true
+     Set-Location -LiteralPath $root
+-    Write-Host 'Lyrics Studio 23.55.0 RC1 - Installer FIX1'
++    Write-Host 'Lyrics Studio 23.55.0 RC2 - Persistence and recovery'
+     if ($Mode -eq 'Restore') {
+         Assert-Package
+         & (Join-Path $root 'tests\InstallerRegression.ps1')
+--- RC1/scripts/ReleaseState.ps1
++++ RC2/scripts/ReleaseState.ps1
+@@ -0,0 +1,136 @@
++# RC2 state transactions. All paths are explicit so tests use only TEMP.
++function Backup-Configuration([string]$destination, [string]$dataFolder) {
++    foreach ($name in @('MB_TTMLLyrics.ini','MB_TTMLLyrics.offsets.ini')) {
++        $path = Join-Path $dataFolder $name
++        if (Test-Path -LiteralPath $path) { Copy-Verified $path (Join-Path $destination $name) }
++    }
++    foreach ($name in @('Profiles','ProfileOverrides')) {
++        $folder = Join-Path $dataFolder ('LyricsStudio\' + $name)
++        if (Test-Path -LiteralPath $folder) {
++            foreach ($file in Get-ChildItem -LiteralPath $folder -File -Filter '*.lyricsprofile.json') {
++                Copy-Verified $file.FullName (Join-Path $destination ($name + '\' + $file.Name))
++            }
++        }
++    }
++}
++
++function Write-BackupManifest([string]$folder) {
++    $folder = [IO.Path]::GetFullPath($folder).TrimEnd('\')
++    $files = @(Get-ChildItem -LiteralPath $folder -File -Recurse | Where-Object { $_.Name -ne 'backup-files.json' } | ForEach-Object {
++        @{ Path=$_.FullName.Substring($folder.Length + 1); Sha256=(Hash $_.FullName) }
++    })
++    @{ Schema=1; Files=$files } | ConvertTo-Json -Depth 5 |
++        Set-Content -LiteralPath (Join-Path $folder 'backup-files.json') -Encoding UTF8
++}
++
++function Read-VerifiedBackup([string]$folder) {
++    $folder = [IO.Path]::GetFullPath($folder).TrimEnd('\')
++    $receipt = Get-Content -LiteralPath (Join-Path $folder 'receipt.json') -Raw | ConvertFrom-Json
++    $manifestPath = Join-Path $folder 'backup-files.json'
++    if (Test-Path -LiteralPath $manifestPath) {
++        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
++        if ($manifest.Schema -ne 1) { throw 'Unsupported backup manifest.' }
++        $verified = @{}
++        foreach ($entry in $manifest.Files) {
++            $path = [IO.Path]::GetFullPath((Join-Path $folder $entry.Path))
++            if (-not $path.StartsWith($folder + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe backup path.' }
++            if ($verified.ContainsKey($path)) { throw 'Duplicate backup entry.' }
++            if ((Hash $path) -ne $entry.Sha256) { throw "Backup checksum mismatch: $($entry.Path)" }
++            $verified[$path] = $true
++        }
++        foreach ($file in Get-ChildItem -LiteralPath $folder -File -Recurse) {
++            if ($file.FullName -ne $manifestPath -and -not $verified.ContainsKey($file.FullName)) {
++                throw "Unverified file in backup: $($file.Name)"
++            }
++        }
++    } elseif ($null -ne $receipt.PSObject.Properties['Schema'] -and $receipt.Schema -ge 2) {
++        throw 'RC2 backup manifest is missing; restore cancelled.'
++    } else {
++        Write-Warning 'Legacy RC1 backup: only the original DLL has a recorded checksum.'
++    }
++    if ($receipt.HadDll -and (Hash (Join-Path $folder 'MB_TTMLLyrics.dll')) -ne $receipt.PreviousHash) {
++        throw 'Backup DLL checksum mismatch; restore cancelled.'
++    }
++    return $receipt
++}
++
++function Invoke-VerifiedFileTransaction([object[]]$operations, [string]$recovery) {
++    [IO.Directory]::CreateDirectory($recovery) | Out-Null
++    $records = New-Object 'System.Collections.Generic.List[object]'
++    $destinations = @{}
++    # Stage and verify every source and every previous destination before the first change.
++    foreach ($operation in $operations) {
++        if ([string]::IsNullOrWhiteSpace($operation.Destination)) { throw 'Empty transaction destination.' }
++        $destination = [IO.Path]::GetFullPath($operation.Destination)
++        if ($destinations.ContainsKey($destination)) { throw 'Duplicate transaction destination.' }
++        $destinations[$destination] = $true
++        $index = $records.Count.ToString('D4')
++        $before = Join-Path $recovery ('before-' + $index)
++        $staged = Join-Path $recovery ('source-' + $index)
++        $hadFile = Test-Path -LiteralPath $destination
++        $beforeHash = ''
++        if ($hadFile) { Copy-Verified $destination $before; $beforeHash = Hash $before }
++        if (-not $operation.Remove) { Copy-Verified $operation.Source $staged }
++        $records.Add([pscustomobject]@{
++            Destination=$destination; Before=$before; BeforeHash=$beforeHash; HadFile=$hadFile;
++            Source=$staged; Remove=[bool]$operation.Remove; Index=$index
++        })
++    }
++    # If this write fails, no live file has changed.
++    @($records.ToArray()) | ConvertTo-Json -Depth 5 |
++        Set-Content -LiteralPath (Join-Path $recovery 'transaction.json') -Encoding UTF8
++    $attempted = New-Object 'System.Collections.Generic.List[object]'
++    try {
++        foreach ($record in $records) {
++            $exists = Test-Path -LiteralPath $record.Destination
++            if ($exists -ne $record.HadFile -or ($exists -and (Hash $record.Destination) -ne $record.BeforeHash)) {
++                throw "Destination changed since backup: $($record.Destination)"
++            }
++            $attempted.Add($record)
++            if ($record.Remove) {
++                if ($exists) { [IO.File]::Move($record.Destination, (Join-Path $recovery ('removed-' + $record.Index))) }
++            } else { Replace-Verified $record.Source $record.Destination }
++        }
++    } catch {
++        $failure = $_
++        $recoveryErrors = New-Object 'System.Collections.Generic.List[string]'
++        for ($i = $attempted.Count - 1; $i -ge 0; $i--) {
++            $record = $attempted[$i]
++            try {
++                $exists = Test-Path -LiteralPath $record.Destination
++                if ($record.HadFile) {
++                    if (-not $exists -or (Hash $record.Destination) -ne $record.BeforeHash) {
++                        Replace-Verified $record.Before $record.Destination
++                    }
++                } elseif ($exists) {
++                    [IO.File]::Move($record.Destination, (Join-Path $recovery ('failed-created-' + $record.Index)))
++                }
++            } catch { $recoveryErrors.Add($record.Destination + ': ' + $_.Exception.Message) }
++        }
++        if ($recoveryErrors.Count -gt 0) {
++            throw ($failure.Exception.Message + '. Automatic recovery incomplete: ' + ($recoveryErrors -join '; ') + '. Recovery files: ' + $recovery)
++        }
++        throw ($failure.Exception.Message + '. Transaction rolled back. Recovery files: ' + $recovery)
++    }
++}
++
++function Restore-ReleaseFiles([string]$backup, [string]$dataFolder, [string]$recovery) {
++    $receipt = Read-VerifiedBackup $backup
++    $operations = New-Object 'System.Collections.Generic.List[object]'
++    $operations.Add(@{ Source=(Join-Path $backup 'MB_TTMLLyrics.dll'); Destination=(Join-Path $receipt.PluginDirectory 'MB_TTMLLyrics.dll'); Remove=(-not $receipt.HadDll) })
++    foreach ($name in @('MB_TTMLLyrics.ini','MB_TTMLLyrics.offsets.ini')) {
++        $source = Join-Path $backup $name
++        if (Test-Path -LiteralPath $source) {
++            $operations.Add(@{ Source=$source; Destination=(Join-Path $dataFolder $name); Remove=$false })
++        }
++    }
++    foreach ($name in @('Profiles','ProfileOverrides')) {
++        $folder = Join-Path $backup $name
++        if (Test-Path -LiteralPath $folder) {
++            foreach ($file in Get-ChildItem -LiteralPath $folder -File -Filter '*.lyricsprofile.json') {
++                $operations.Add(@{ Source=$file.FullName; Destination=(Join-Path $dataFolder ('LyricsStudio\' + $name + '\' + $file.Name)); Remove=$false })
++            }
++        }
++    }
++    Invoke-VerifiedFileTransaction ($operations.ToArray()) $recovery
++}

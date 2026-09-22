@@ -1,0 +1,31 @@
+# Build outputs
+dist/
+validation/
+*.dll
+*.exe
+*.pdb
+*.obj
+*.user
+*.suo
+
+# Local IDE/editor state
+.vs/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Windows/temp
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
+*.old
+
+# Local MusicBee/user state
+MB_TTMLLyrics.ini
+MB_TTMLLyrics.offsets.ini
+LyricsStudio/Backups/
+LyricsStudio/Logs/

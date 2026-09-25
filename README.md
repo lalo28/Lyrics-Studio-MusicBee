@@ -1,4 +1,7 @@
 # Lyrics Studio for MusicBee
+ <img width="3838" height="2058" alt="image" src="https://github.com/user-attachments/assets/133c1031-9c8f-4e93-8e17-dc47336d9206" />
+ <img width="3836" height="2040" alt="image" src="https://github.com/user-attachments/assets/6b89b3bd-72d7-4176-8836-7f0a6e82d3e5" />
+
 
 Lyrics Studio is a Windows/MusicBee lyrics-view plugin focused on synchronized TTML/ELRC/LRC playback, word-level karaoke, configurable profiles, adaptive backgrounds, fullscreen/projection output, and a CPU-safe renderer baseline.
 
@@ -81,3 +84,5 @@ Portable static validation currently checks source contracts and package integri
 ## License
 
 No open-source license has been selected for this repository yet. Until a license is explicitly added, the source is **not automatically granted an open-source reuse license**.
+
+ko-fi.com/eduardomartinez62369
